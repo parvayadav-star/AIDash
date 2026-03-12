@@ -1,0 +1,14 @@
+# Secrets — never commit these
+.env
+.streamlit/secrets.toml
+
+# Data exports — keep locally, not in git
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Docker (local only)
+docker-compose.yml
