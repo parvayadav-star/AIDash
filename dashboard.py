@@ -444,7 +444,13 @@ with st.expander("Nth Call Analysis", expanded=True):
     st.subheader("Performance by Call Attempt Number")
     st.caption("Valid-number calls only, sorted by number → time. Each row = the nth time we called that number.")
 
-    nth_base = fdf[fdf["Number Category"] == "valid"].copy()
+    nth_agents = sorted(fdf["Agent Number"].dropna().unique().tolist())
+    nth_sel_agents = st.multiselect("Agent Number", nth_agents, default=nth_agents, key="nth_agents")
+
+    nth_base = fdf[
+        (fdf["Number Category"] == "valid") &
+        (fdf["Agent Number"].isin(nth_sel_agents))
+    ].copy()
     nth_base = nth_base.sort_values(["Number", "Time"])
     nth_base["call_number"] = nth_base.groupby("Number").cumcount() + 1
 
