@@ -1,25 +1,11 @@
-import os
-import math
+from pathlib import Path
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from dotenv import load_dotenv
-from supabase import create_client
 
-load_dotenv()
 st.set_page_config(page_title="Call Analytics", layout="wide")
-
-# ── Supabase client ───────────────────────────────────────────────────────────
-def _sb():
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-    except Exception:
-        url = os.getenv("SUPABASE_URL", "")
-        key = os.getenv("SUPABASE_KEY", "")
-    return create_client(url, key)
 
 # ── Status groupings ──────────────────────────────────────────────────────────
 # call_in_queue  → not yet dialed
@@ -33,6 +19,13 @@ DIALED_STATUSES   = {"call_placed", "could_not_connect", "completed", "call_hang
                      "agent_errored", "call_errored"}
 RINGING_STATUSES  = {"could_not_connect", "completed", "call_hangup"}   # rang but may not have been answered
 ANSWERED_STATUSES = {"completed"}
+
+
+def normalise_agent(val):
+    try:
+        return "+" + str(int(float(val)))
+    except (ValueError, TypeError):
+        return None
 
 
 def classify_number(num):
@@ -53,52 +46,34 @@ def classify_number(num):
     return "valid"
 
 
-@st.cache_data(ttl=300)   # auto-refresh every 5 minutes
+@st.cache_data
 def load_data():
-    sb   = _sb()
-    rows = []
-    PAGE = 1000
-    offset = 0
-    while True:
-        result = sb.table("calls").select("*").range(offset, offset + PAGE - 1).execute()
-        rows.extend(result.data)
-        if len(result.data) < PAGE:
-            break
-        offset += PAGE
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
+    data_dir  = Path(__file__).parent
+    csv_files = sorted(data_dir.glob("*.csv"))
+    if not csv_files:
+        return pd.DataFrame()
 
-    # Map DB snake_case columns → original display names used throughout the app
-    df = df.rename(columns={
-        "number": "Number", "time": "Time", "use_case": "Use Case",
-        "call_status": "Call Status", "duration": "Duration",
-        "agent_number": "Agent Number", "recording_url": "Recording URL",
-        "summary": "Analysis.summary", "user_sentiment": "Analysis.user_sentiment",
-        "task_completion": "Analysis.task_completion", "issue_status": "Analysis.issue_status",
-        "call_quality": "Analysis.call_quality", "status": "Analysis.status",
-        "activity_status": "Analysis.activity_status", "activity_time": "Analysis.activity_time",
-        "call_summary": "Analysis.call_summary", "long_hault_reason": "Analysis.long_hault_reason",
-        "not_interested_reason": "Analysis.not_interested_reason",
-        "notice_period": "Analysis.notice_period", "is_jaipur_based": "Analysis.is_jaipur_based",
-        "can_operate_laptop": "Analysis.can_operate_laptop",
-        "preferred_device": "Analysis.preferred_device",
-        "can_handle_documents": "Analysis.can_handle_documents",
-        "is_over_qualified": "Analysis.is_over_qualified", "is_misaligned": "Analysis.is_misaligned",
-        "knows_excel_or_sheets": "Analysis.knows_excel_or_sheets",
-        "preferred_date": "Analysis.preferred_date", "expected_salary": "Analysis.expected_salary",
-        "status_for_next_round": "Analysis.status_for_next_round",
-        "interview_preferred_date": "Analysis.interview_preferred_date",
-        "current_salary": "Analysis.current_salary",
-        "number_category": "Number Category",
-    })
-    df = df.drop(columns=["ingested_at"], errors="ignore")
-    df["Time"] = pd.to_datetime(df["Time"], errors="coerce", utc=True).dt.tz_localize(None)
-    df["Duration"] = pd.to_numeric(df["Duration"], errors="coerce")
+    dfs = [pd.read_csv(f) for f in csv_files]
+    df  = pd.concat(dfs, ignore_index=True)
+    df.columns = df.columns.str.strip()
+
+    df["Time"]         = pd.to_datetime(df["Time"], errors="coerce")
+    df["Duration"]     = pd.to_numeric(df["Duration"], errors="coerce")
+    df["Agent Number"] = df["Agent Number"].apply(normalise_agent)
+
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].replace({"-": None, "": None, "nan": None})
+
+    df["Number Category"] = df["Number"].apply(classify_number)
+    df = df.dropna(subset=["Number", "Time"])
+    df = df.drop_duplicates(subset=["Number", "Time"], keep="last")
     return df
 
 
 df = load_data()
+if df.empty:
+    st.error("No CSV files found. Place your export CSV files in the same folder as dashboard.py, then refresh.")
+    st.stop()
 
 # ── Sidebar filters ───────────────────────────────────────────────────────────
 st.sidebar.header("Filters")
@@ -600,9 +575,19 @@ with st.expander("Daily Deviation Analysis", expanded=True):
         ).round(1)
         dev_pivot.index = dev_pivot.index.astype(str)
 
+        def _color_dev(val):
+            if pd.isna(val):
+                return ""
+            t = max(-1.0, min(1.0, val / 20))   # clamp to [-1, 1]
+            if t >= 0:
+                r, g = int(255 * (1 - t)), 255
+            else:
+                r, g = 255, int(255 * (1 + t))
+            return f"background-color: rgb({r},{g},80); color: #000"
+
         st.markdown("**Deviation from each dimension's own average (percentage points)**")
         st.dataframe(
-            dev_pivot.style.background_gradient(cmap="RdYlGn", axis=None, vmin=-20, vmax=20),
+            dev_pivot.style.map(_color_dev),
             use_container_width=True,
         )
 
