@@ -2,7 +2,9 @@ import os
 import math
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -434,3 +436,172 @@ with st.expander("Table Canvas — Build Any Table", expanded=True):
             )
         except Exception as e:
             st.error(f"Could not build table: {e}")
+
+st.divider()
+
+# ── Section 5: Nth Call Analysis ──────────────────────────────────────────────
+with st.expander("Nth Call Analysis", expanded=True):
+    st.subheader("Performance by Call Attempt Number")
+    st.caption("Valid-number calls only, sorted by number → time. Each row = the nth time we called that number.")
+
+    nth_base = fdf[fdf["Number Category"] == "valid"].copy()
+    nth_base = nth_base.sort_values(["Number", "Time"])
+    nth_base["call_number"] = nth_base.groupby("Number").cumcount() + 1
+
+    tab_n1, tab_n2, tab_n3 = st.tabs(["Call Number Table", "Pickup Rate Trend", "Frequency Heatmap"])
+
+    with tab_n1:
+        nth_stats = (
+            nth_base.groupby("call_number")
+            .agg(
+                total        =("call_number", "count"),
+                picked_up    =("Call Status", lambda x: x.isin(ANSWERED_STATUSES).sum()),
+                task_done    =("Analysis.task_completion", lambda x: (x == "true").sum()),
+                neg_sentiment=("Analysis.user_sentiment", lambda x: x.str.lower().eq("negative").sum()),
+            )
+            .reset_index()
+        )
+        nth_stats["Pick Rate %"]        = (nth_stats["picked_up"] / nth_stats["total"] * 100).round(1)
+        nth_stats["Task Done % (of picked)"] = (
+            nth_stats["task_done"] / nth_stats["picked_up"].replace(0, np.nan) * 100
+        ).fillna(0).round(1)
+        nth_stats = nth_stats.rename(columns={
+            "call_number": "Nth Call", "total": "Total Calls",
+            "picked_up": "Picked Up", "task_done": "Task Done", "neg_sentiment": "Negative Sentiment",
+        })
+        st.dataframe(nth_stats, use_container_width=True, hide_index=True)
+        st.download_button("Download", nth_stats.to_csv(index=False).encode(),
+                           "nth_call.csv", "text/csv")
+
+    with tab_n2:
+        fig_nth = px.line(nth_stats, x="Nth Call", y="Pick Rate %",
+                          markers=True, title="Pickup Rate by Call Attempt")
+        fig_nth.update_layout(margin=dict(t=40), yaxis_range=[0, 100],
+                              yaxis_ticksuffix="%")
+        st.plotly_chart(fig_nth, use_container_width=True)
+
+        # Also show task done rate trend
+        fig_nth2 = px.line(nth_stats, x="Nth Call", y="Task Done % (of picked)",
+                           markers=True, title="Task Completion Rate by Call Attempt",
+                           color_discrete_sequence=["#2ecc71"])
+        fig_nth2.update_layout(margin=dict(t=40), yaxis_range=[0, 100],
+                               yaxis_ticksuffix="%")
+        st.plotly_chart(fig_nth2, use_container_width=True)
+
+    with tab_n3:
+        st.caption("How many completed calls each user had vs total calls made to them.")
+        user_summary = (
+            nth_base.groupby("Number")
+            .agg(
+                total_calls    =("Number", "count"),
+                completed_calls=("Call Status", lambda x: x.isin(ANSWERED_STATUSES).sum()),
+            )
+            .reset_index()
+        )
+        user_summary["total_bucket"]     = user_summary["total_calls"].clip(upper=10)
+        user_summary["completed_bucket"] = user_summary["completed_calls"].clip(upper=10)
+
+        freq = (
+            user_summary.groupby(["total_bucket", "completed_bucket"])
+            .size().reset_index(name="users")
+        )
+        pivot_h = freq.pivot(index="total_bucket", columns="completed_bucket", values="users").fillna(0)
+        pct_h   = pivot_h.div(pivot_h.sum(axis=1), axis=0) * 100
+
+        # Mask impossible cells (completed > total)
+        mask = np.array([[c > r for c in pct_h.columns] for r in pct_h.index])
+        pct_masked = pct_h.where(~mask)
+
+        fig_hm = go.Figure(go.Heatmap(
+            z=pct_masked.values,
+            x=[f"{int(c)}+" if c == 10 else str(int(c)) for c in pct_masked.columns],
+            y=[f"{int(r)}+" if r == 10 else str(int(r)) for r in pct_masked.index],
+            colorscale="YlGnBu",
+            text=pct_masked.values.round(1),
+            texttemplate="%{text:.1f}%",
+            colorbar=dict(title="%"),
+        ))
+        fig_hm.update_layout(
+            title="% of Users by Total Calls vs Calls Picked Up",
+            xaxis_title="Calls Picked Up",
+            yaxis_title="Total Calls Made to Number",
+            height=500, margin=dict(t=40),
+        )
+        st.plotly_chart(fig_hm, use_container_width=True)
+
+st.divider()
+
+# ── Section 6: Daily Deviation Analysis ───────────────────────────────────────
+with st.expander("Daily Deviation Analysis", expanded=True):
+    st.subheader("Day-on-Day Deviations from Average")
+    st.caption(
+        "Shows how each dimension's daily rate deviates from its own overall average. "
+        "Green = above average, Red = below average. Valid-number calls only."
+    )
+
+    dev_base = df[
+        (df["Time"].dt.date >= date_range[0])
+        & (df["Time"].dt.date <= date_range[1])
+        & (df["Use Case"].isin(selected_use_cases))
+        & (df["Number Category"] == "valid")
+    ].copy()
+    dev_base["Date"] = dev_base["Time"].dt.date
+
+    dev_dim    = st.radio("Break down by", ["Use Case", "Agent Number"],
+                          horizontal=True, key="dev_dim")
+    dev_metric = st.selectbox("Metric", ["Pick Rate %", "Place Rate %", "Dial Rate %"],
+                              key="dev_metric")
+
+    def compute_rates(g):
+        total   = len(g)
+        dialed  = g["Call Status"].isin(DIALED_STATUSES).sum()
+        ringing = g["Call Status"].isin(RINGING_STATUSES).sum()
+        answered= g["Call Status"].isin(ANSWERED_STATUSES).sum()
+        return pd.Series({
+            "Dial Rate %":  round(dialed   / total   * 100, 1) if total   else None,
+            "Place Rate %": round(ringing  / dialed  * 100, 1) if dialed  else None,
+            "Pick Rate %":  round(answered / ringing * 100, 1) if ringing else None,
+            "Calls": total,
+        })
+
+    daily_dev = dev_base.groupby(["Date", dev_dim]).apply(compute_rates).reset_index()
+    daily_dev["Date"] = pd.to_datetime(daily_dev["Date"])
+
+    # Compute overall average per dimension value
+    overall_avg = daily_dev.groupby(dev_dim)[dev_metric].mean()
+    daily_dev["Overall Avg"] = daily_dev[dev_dim].map(overall_avg)
+    daily_dev["Deviation"]   = (daily_dev[dev_metric] - daily_dev["Overall Avg"]).round(1)
+
+    # Filter dimension values
+    all_dim_vals = sorted(daily_dev[dev_dim].dropna().unique().tolist())
+    chosen_dims  = st.multiselect(f"Select {dev_dim}(s)", all_dim_vals, default=all_dim_vals,
+                                  key="dev_vals")
+    plot_dev = daily_dev[daily_dev[dev_dim].isin(chosen_dims)]
+
+    if plot_dev.empty:
+        st.info("No data.")
+    else:
+        # Line chart: actual rate vs overall avg per dimension
+        fig_dev = px.line(plot_dev, x="Date", y=dev_metric, color=dev_dim,
+                          markers=True, hover_data=["Calls", "Overall Avg", "Deviation"])
+        fig_dev.update_layout(margin=dict(t=20), yaxis_range=[0, 100],
+                              yaxis_ticksuffix="%")
+        st.plotly_chart(fig_dev, use_container_width=True)
+
+        # Deviation pivot table with colour
+        dev_pivot = plot_dev.pivot_table(
+            index="Date", columns=dev_dim, values="Deviation"
+        ).round(1)
+        dev_pivot.index = dev_pivot.index.astype(str)
+
+        st.markdown("**Deviation from each dimension's own average (percentage points)**")
+        st.dataframe(
+            dev_pivot.style.background_gradient(cmap="RdYlGn", axis=None, vmin=-20, vmax=20),
+            use_container_width=True,
+        )
+
+        st.download_button(
+            "Download deviation table",
+            data=dev_pivot.to_csv().encode(),
+            file_name="daily_deviation.csv", mime="text/csv"
+        )
